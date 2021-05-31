@@ -12,9 +12,10 @@ use actix::SpawnHandle;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
-use tokio::stream::{Stream, StreamExt};
 use tokio::sync::mpsc;
-use tokio::time::{DelayQueue, Instant};
+use tokio::time::{self, Instant};
+use tokio_stream::{Stream, StreamExt};
+use tokio_util::time::DelayQueue;
 use tracing::{error, info, warn};
 
 use crate::metrics::pubsub_metrics as metrics;
@@ -74,12 +75,13 @@ impl AccountUpdateManager {
             let (handle, stream) = delay_queue();
             let purge_stream = stream.map(AccountCommand::Purge);
 
+            ctx.add_stream(purge_stream);
             ctx.set_mailbox_capacity(MAILBOX_CAPACITY);
 
             ctx.run_interval(Duration::from_secs(1), |actor, ctx| {
                 if actor.connected.load(Ordering::Relaxed) {
                     if let Some((sink, _)) = &mut actor.connection {
-                        sink.write(awc::ws::Message::Ping(b"hello?".as_ref().into()));
+                        let _ = sink.write(awc::ws::Message::Ping(b"hello?".as_ref().into()));
                     }
                     if actor.last_pong.elapsed() > WEBSOCKET_PING_TIMEOUT {
                         warn!("websocket pong not received in time, assume connection lost");
@@ -88,7 +90,6 @@ impl AccountUpdateManager {
                 }
             });
 
-            AccountUpdateManager::add_stream(purge_stream, ctx);
             AccountUpdateManager {
                 websocket_url: websocket_url.to_owned(),
                 connection: None,
@@ -115,7 +116,14 @@ impl AccountUpdateManager {
 
     fn send<T: Serialize>(&mut self, request: &T) -> Result<(), serde_json::Error> {
         if let Some((sink, _)) = &mut self.connection {
-            sink.write(awc::ws::Message::Text(serde_json::to_string(request)?));
+            if sink
+                .write(awc::ws::Message::Text(
+                    serde_json::to_string(request)?.into(),
+                ))
+                .is_err()
+            {
+                warn!("failed to send ws message");
+            }
         } else {
             warn!("no sink");
         }
@@ -123,7 +131,7 @@ impl AccountUpdateManager {
     }
 
     fn connect(&self, ctx: &mut Context<Self>) {
-        use actix::fut::{ActorFuture, WrapFuture};
+        use actix::fut::{ActorFutureExt, WrapFuture};
         use backoff::backoff::Backoff;
 
         let websocket_url = self.websocket_url.clone();
@@ -144,7 +152,8 @@ impl AccountUpdateManager {
                     Ok((_, conn)) => break conn,
                     Err(err) => {
                         error!(message = "failed to connect", url = %websocket_url, error = ?err);
-                        tokio::time::delay_for(
+                        error!("failed to connect to {} {:?}", websocket_url, err);
+                        time::sleep(
                             backoff
                                 .next_backoff()
                                 .unwrap_or_else(|| Duration::from_secs(1)),
@@ -168,7 +177,7 @@ impl AccountUpdateManager {
                     .filter_map(Result::ok),
             );
             let sink = SinkWrite::new(sink, ctx);
-            let stream_handle = AccountUpdateManager::add_stream(stream, ctx);
+            let stream_handle = ctx.add_stream(stream);
             actor.last_pong = Instant::now();
 
             if let Some((_, handle)) =
@@ -356,7 +365,7 @@ impl StreamHandler<awc::ws::Frame> for AccountUpdateManager {
             match item {
                 Frame::Ping(data) => {
                     if let Some((sink, _)) = &mut self.connection {
-                        sink.write(awc::ws::Message::Pong(data));
+                        let _ = sink.write(awc::ws::Message::Pong(data));
                     }
                 }
                 Frame::Pong(_) => {
@@ -619,7 +628,7 @@ fn delay_queue<T: Clone + std::hash::Hash + Eq>() -> (DelayQueueHandle<T>, impl 
 
         loop {
             tokio::select! {
-                item = incoming.next() => {
+                item = incoming.recv() => {
                     if let Some(item) = item {
                         match item {
                             DelayQueueCommand::Insert(item, time) => {

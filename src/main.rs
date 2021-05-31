@@ -154,13 +154,7 @@ async fn run(options: Options) {
     HttpServer::new(move || {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
-            .connector(
-                awc::Connector::new()
-                    .limit(connection_limit)
-                    //.conn_keep_alive(Duration::from_secs(0))
-                    //.conn_lifetime(Duration::from_secs(0))
-                    .finish(),
-            )
+            .connector(awc::Connector::new().limit(connection_limit))
             .finish();
         let state = rpc::State {
             accounts: accounts.clone(),
@@ -183,7 +177,7 @@ async fn run(options: Options) {
             .allowed_methods(vec!["POST"])
             .allowed_header(actix_web::http::header::CONTENT_TYPE);
         App::new()
-            .data(state)
+            .app_data(web::Data::new(state))
             .wrap(cors)
             .service(web::resource("/").route(web::post().to(rpc::rpc_handler)))
             .service(web::resource("/metrics").route(web::get().to(rpc::metrics_handler)))

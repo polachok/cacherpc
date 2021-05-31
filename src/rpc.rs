@@ -8,7 +8,7 @@ use std::sync::{
 use std::time::Duration;
 
 use actix::prelude::Addr;
-use actix_web::{web, HttpResponse, ResponseError};
+use actix_web::{http::StatusCode, web, HttpResponse, ResponseError};
 
 use awc::Client;
 use backoff::backoff::Backoff;
@@ -20,6 +20,7 @@ use serde_json::value::{to_raw_value, RawValue};
 use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
+use tokio::time;
 use tracing::{error, info, warn};
 
 use crate::accounts::{AccountCommand, AccountUpdateManager, Subscription};
@@ -233,7 +234,7 @@ impl State {
                     break Ok(body);
                 }
                 Err(err) => match backoff.next_backoff() {
-                    Some(duration) => tokio::time::delay_for(duration).await,
+                    Some(duration) => time::sleep(duration).await,
                     None => {
                         warn!("request: {:?} error: {:?}", req, err);
                         break Err(awc::error::SendRequestError::Timeout);
@@ -375,29 +376,36 @@ impl From<serde_json::Error> for Error<'_> {
 
 impl ResponseError for Error<'_> {
     fn error_response(&self) -> HttpResponse {
+        macro_rules! to_response {
+            ($e: expr) => {
+                HttpResponse::build(StatusCode::OK)
+                    .content_type("application/json")
+                    .body(serde_json::to_string(&$e).unwrap())
+            };
+        }
         match self {
-            Error::InvalidRequest(req_id, msg) => HttpResponse::Ok()
-                .content_type("application/json")
-                .json(&ErrorResponse::invalid_request(req_id.clone(), *msg)),
+            Error::InvalidRequest(req_id, msg) => {
+                to_response!(ErrorResponse::invalid_request(req_id.clone(), *msg))
+            }
             Error::InvalidParam {
                 req_id,
                 message,
                 data,
-            } => HttpResponse::Ok().content_type("application/json").json(
-                &ErrorResponse::invalid_param(req_id.clone(), message.clone(), data.clone()),
-            ),
-            Error::Parsing(req_id) => HttpResponse::Ok()
-                .content_type("application/json")
-                .json(&ErrorResponse::parse_error(req_id.clone())),
-            Error::NotEnoughArguments(req_id) => HttpResponse::Ok()
-                .content_type("application/json")
-                .json(&ErrorResponse::not_enough_arguments(req_id.clone())),
-            Error::Timeout(req_id) => HttpResponse::Ok()
-                .content_type("application/json")
-                .json(&ErrorResponse::gateway_timeout(Some(req_id.clone()))),
-            Error::Forward(_) => HttpResponse::Ok()
-                .content_type("application/json")
-                .json(&ErrorResponse::gateway_timeout(None)),
+            } => to_response!(ErrorResponse::invalid_param(
+                req_id.clone(),
+                message.clone(),
+                data.clone(),
+            )),
+            Error::Parsing(req_id) => to_response!(ErrorResponse::parse_error(req_id.clone())),
+            Error::NotEnoughArguments(req_id) => {
+                to_response!(ErrorResponse::not_enough_arguments(req_id.clone()))
+            }
+            Error::Timeout(req_id) => {
+                to_response!(ErrorResponse::gateway_timeout(Some(req_id.clone())))
+            }
+            Error::Forward(_) => {
+                to_response!(ErrorResponse::gateway_timeout(None))
+            }
         }
     }
 }
@@ -459,8 +467,8 @@ fn account_response<'a, 'b>(
             .observe(body.len() as f64);
 
         return Ok(HttpResponse::Ok()
-            .header("x-cache-status", "hit")
-            .header("x-cache-type", "lru")
+            .append_header(("x-cache-status", "hit"))
+            .append_header(("x-cache-type", "lru"))
             .content_type("application/json")
             .body(body));
     }
@@ -505,8 +513,8 @@ fn account_response<'a, 'b>(
         .observe(body.len() as f64);
 
     Ok(HttpResponse::Ok()
-        .header("x-cache-status", "hit")
-        .header("x-cache-type", "data")
+        .append_header(("x-cache-status", "hit"))
+        .append_header(("x-cache-type", "data"))
         .content_type("application/json")
         .body(body))
 }
@@ -651,7 +659,7 @@ async fn get_account_info(
             Response::Result(info) => {
                 info!(%pubkey, "cached for key");
                 app_state.insert(pubkey, info, config.commitment.unwrap_or_default());
-                app_state.map_updated.notify();
+                app_state.map_updated.notify_waiters();
             }
             Response::Error(error) => {
                 metrics()
@@ -680,7 +688,7 @@ async fn get_account_info(
     }
 
     Ok(HttpResponse::Ok()
-        .header("x-cache-status", "miss")
+        .append_header(("x-cache-status", "miss"))
         .content_type("application/json")
         .body(resp))
 }
@@ -810,8 +818,8 @@ fn program_accounts_response<'a>(
         .with_label_values(&["getProgramAccounts"])
         .observe(body.len() as f64);
     Ok(HttpResponse::Ok()
-        .header("x-cache-status", "hit")
-        .header("x-cache-type", "data")
+        .append_header(("x-cache-status", "hit"))
+        .append_header(("x-cache-type", "data"))
         .content_type("application/json")
         .body(body))
 }
@@ -992,7 +1000,7 @@ async fn get_program_accounts(
                     config.commitment.unwrap_or_default(),
                     filters,
                 );
-                app_state.map_updated.notify();
+                app_state.map_updated.notify_waiters();
             }
             Response::Error(error) => {
                 metrics()
@@ -1006,7 +1014,7 @@ async fn get_program_accounts(
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
-        .header("x-cache-status", "miss")
+        .append_header(("x-cache-status", "miss"))
         .body(resp))
 }
 
@@ -1055,7 +1063,7 @@ pub(crate) async fn rpc_handler(
     let url = app_state.rpc_url.clone();
 
     let stream = stream_generator::generate_stream(move |mut stream| async move {
-        use tokio::stream::StreamExt;
+        use tokio_stream::StreamExt;
         let mut backoff = backoff_settings();
         loop {
             let resp = client
@@ -1071,7 +1079,7 @@ pub(crate) async fn rpc_handler(
                     return;
                 }
                 Err(err) => match backoff.next_backoff() {
-                    Some(duration) => tokio::time::delay_for(duration).await,
+                    Some(duration) => tokio::time::sleep(duration).await,
                     None => {
                         warn!("request error: {:?}", err);
                         // TODO: return error
