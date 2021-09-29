@@ -282,33 +282,29 @@ impl State {
         raw_request: Request<'_, RawValue>,
     ) -> CacheResult<'_> {
         let request = T::parse(&raw_request)?;
-        let is_cacheable = match request
-            .is_cacheable(&self)
-            .map(|_| request.get_from_cache(&raw_request.id, &self))
-        {
-            Ok(Some(data)) => {
-                T::cache_hit_counter().inc();
-                self.reset(request.sub_descriptor());
-                return data;
+        let cacheable = request.is_cacheable(&self);
+        // data slice can still be retrieved from cache
+        let retrievable = cacheable.as_ref().or_else(|reason| {
+            if matches!(reason, UncacheableReason::DataSlice) {
+                Ok(&())
+            } else {
+                Err(reason)
             }
-            Ok(None) => true,
-            Err(reason) => {
-                let data = reason
-                    .can_get_from_cache()
-                    .then(|| request.get_from_cache(&raw_request.id, &self))
-                    .flatten();
+        });
 
-                if let Some(data) = data {
+        match retrievable {
+            Ok(_) => {
+                if let Some(data) = request.get_from_cache(&raw_request.id, &self) {
                     T::cache_hit_counter().inc();
                     self.reset(request.sub_descriptor());
                     return data;
                 }
-
+            }
+            Err(reason) => {
                 metrics()
                     .response_uncacheable
                     .with_label_values(&[T::REQUEST_TYPE, reason.as_str()])
                     .inc();
-                false
             }
         };
 
@@ -325,7 +321,7 @@ impl State {
                         Error::Timeout(raw_request.id.clone())
                     })?;
                 }
-                _ = notified, if is_cacheable => {
+                _ = notified, if retrievable.is_ok() => {
                     if let Some(data) = request.get_from_cache(&raw_request.id, &self) {
                         T::cache_hit_counter().inc();
                         T::cache_filled_counter().inc();
@@ -342,7 +338,7 @@ impl State {
             .header("x-cache-status", "miss")
             .content_type("application/json");
 
-        if is_cacheable {
+        if cacheable.is_ok() {
             let this = Arc::clone(&self);
             let stream = stream_generator::generate_try_stream(move |mut stream| async move {
                 let mut bytes_chain = BytesChain::new();
@@ -463,10 +459,10 @@ impl Cacheable for GetAccountInfo {
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason> {
         if self.config.encoding == Encoding::JsonParsed {
             Err(UncacheableReason::Encoding)
-        } else if self.config.data_slice.is_some() {
-            Err(UncacheableReason::DataSlice)
         } else if !state.subscription_active(self.pubkey) {
             Err(UncacheableReason::Inactive)
+        } else if self.config.data_slice.is_some() {
+            Err(UncacheableReason::DataSlice)
         } else {
             Ok(())
         }
@@ -560,12 +556,12 @@ impl Cacheable for GetProgramAccounts {
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason> {
         if self.config.encoding == Encoding::JsonParsed {
             Err(UncacheableReason::Encoding)
+        } else if !state.subscription_active(self.pubkey) {
+            Err(UncacheableReason::Inactive)
         } else if self.config.data_slice.is_some() {
             Err(UncacheableReason::DataSlice)
         } else if !self.valid_filters {
             Err(UncacheableReason::Filters)
-        } else if !state.subscription_active(self.pubkey) {
-            Err(UncacheableReason::Inactive)
         } else {
             Ok(())
         }
@@ -667,14 +663,6 @@ impl UncacheableReason {
             Self::Inactive => "inactive_sub",
             Self::DataSlice => "data_slice",
             Self::Filters => "bad_filters",
-        }
-    }
-
-    /// Returns true if the request can still be fetched from cache
-    fn can_get_from_cache(&self) -> bool {
-        match self {
-            Self::DataSlice => true,
-            Self::Encoding | Self::Inactive | Self::Filters => false,
         }
     }
 }
