@@ -293,6 +293,17 @@ impl State {
             }
             Ok(None) => true,
             Err(reason) => {
+                let data = reason
+                    .can_get_from_cache()
+                    .then(|| request.get_from_cache(&raw_request.id, &self))
+                    .flatten();
+
+                if let Some(data) = data {
+                    T::cache_hit_counter().inc();
+                    self.reset(request.sub_descriptor());
+                    return data;
+                }
+
                 metrics()
                     .response_uncacheable
                     .with_label_values(&[T::REQUEST_TYPE, reason.as_str()])
@@ -656,6 +667,14 @@ impl UncacheableReason {
             Self::Inactive => "inactive_sub",
             Self::DataSlice => "data_slice",
             Self::Filters => "bad_filters",
+        }
+    }
+
+    /// Returns true if the request can still be fetched from cache
+    fn can_get_from_cache(&self) -> bool {
+        match self {
+            Self::DataSlice => true,
+            Self::Encoding | Self::Inactive | Self::Filters => false,
         }
     }
 }
