@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
+use std::task::Poll;
 use std::time::Duration;
 
 use actix::io::SinkWrite;
@@ -83,6 +86,27 @@ pub struct Config {
 #[derive(Clone)]
 pub struct PubSubManager(Vec<(actix::Addr<AccountUpdateManager>, Arc<AtomicBool>)>);
 
+pub enum SubscriptionActive {
+    Ready(bool),
+    Request(actix::prelude::Request<AccountUpdateManager, IsSubActive>),
+}
+
+impl Future for SubscriptionActive {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Self::Output> {
+        let mut inner = Pin::into_inner(self);
+        match &mut inner {
+            SubscriptionActive::Ready(res) => Poll::Ready(*res),
+            SubscriptionActive::Request(ref mut req) => match Pin::new(req).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(value)) => Poll::Ready(value),
+                Poll::Ready(Err(_)) => Poll::Ready(false),
+            },
+        }
+    }
+}
+
 impl PubSubManager {
     pub fn init(
         connections: u32,
@@ -128,14 +152,13 @@ impl PubSubManager {
         self.0[idx].1.load(Ordering::Relaxed)
     }
 
-    pub fn subscription_active(&self, sub: Subscription, commitment: Commitment) -> bool {
-        let idx = self.get_idx_by_key(sub.key());
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.0[idx]
-            .0
-            .do_send(AccountCommand::IsSubActive(sub, commitment, tx));
-        let res = rx.recv();
-        res.unwrap_or(false)
+    pub fn subscription_active(&self, sub: Subscription, commitment: Commitment) -> SubscriptionActive {
+        if self.websocket_active(sub.key()) {
+            let idx = self.get_idx_by_key(sub.key());
+            SubscriptionActive::Request(self.0[idx].0.send(IsSubActive { sub, commitment }))
+        } else {
+            SubscriptionActive::Ready(false)
+        }
     }
 
     pub fn reset(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
@@ -1032,6 +1055,14 @@ impl StreamHandler<AccountCommand> for AccountUpdateManager {
     }
 }
 
+impl Handler<IsSubActive> for AccountUpdateManager {
+    type Result = bool;
+
+    fn handle(&mut self, item: IsSubActive, _: &mut Context<Self>) -> bool {
+        self.sub_to_id.contains_key(&(item.sub, item.commitment))
+    }
+}
+
 impl Handler<AccountCommand> for AccountUpdateManager {
     type Result = ();
 
@@ -1064,11 +1095,6 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     }
                     self.purge_key(ctx, &sub, commitment);
                 }
-                AccountCommand::IsSubActive(sub, cmtmt, tx) => {
-                    let res = self.sub_to_id.contains_key(&(sub, cmtmt));
-                    let _ = tx.send(res);
-                }
-
                 AccountCommand::Reset(sub, commitment, filters) => {
                     metrics()
                         .commands
@@ -1291,10 +1317,16 @@ impl std::fmt::Display for Subscription {
 #[derive(Message, Debug)]
 #[rtype(result = "()")]
 pub enum AccountCommand {
-    IsSubActive(Subscription, Commitment, std::sync::mpsc::Sender<bool>),
     Subscribe(Subscription, Commitment, Option<Filters>),
     Reset(Subscription, Commitment, Option<Filters>),
     Purge(Subscription, Commitment),
+}
+
+#[derive(Message, Debug)]
+#[rtype(result = "bool")]
+pub struct IsSubActive {
+    sub: Subscription,
+    commitment: Commitment,
 }
 
 enum DelayQueueCommand<T> {
