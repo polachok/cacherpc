@@ -123,9 +123,19 @@ impl PubSubManager {
         self.0[idx].0.clone()
     }
 
-    pub fn subscription_active(&self, key: Pubkey) -> bool {
+    pub fn websocket_active(&self, key: Pubkey) -> bool {
         let idx = self.get_idx_by_key(key);
         self.0[idx].1.load(Ordering::Relaxed)
+    }
+
+    pub fn subscription_active(&self, sub: Subscription, commitment: Commitment) -> bool {
+        let idx = self.get_idx_by_key(sub.key());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.0[idx]
+            .0
+            .do_send(AccountCommand::IsSubActive(sub, commitment, tx));
+        let res = rx.recv();
+        res.unwrap_or(false)
     }
 
     pub fn reset(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
@@ -631,7 +641,7 @@ impl AccountUpdateManager {
     }
 
     fn update_status(&self) {
-        let is_active = self.id_to_sub.len() == self.subs.len() && self.connection.is_connected();
+        let is_active = self.connection.is_connected();
         self.active.store(is_active, Ordering::Relaxed);
 
         metrics()
@@ -1054,6 +1064,11 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     }
                     self.purge_key(ctx, &sub, commitment);
                 }
+                AccountCommand::IsSubActive(sub, cmtmt, tx) => {
+                    let res = self.sub_to_id.contains_key(&(sub, cmtmt));
+                    let _ = tx.send(res);
+                }
+
                 AccountCommand::Reset(sub, commitment, filters) => {
                     metrics()
                         .commands
@@ -1276,6 +1291,7 @@ impl std::fmt::Display for Subscription {
 #[derive(Message, Debug)]
 #[rtype(result = "()")]
 pub enum AccountCommand {
+    IsSubActive(Subscription, Commitment, std::sync::mpsc::Sender<bool>),
     Subscribe(Subscription, Commitment, Option<Filters>),
     Reset(Subscription, Commitment, Option<Filters>),
     Purge(Subscription, Commitment),
