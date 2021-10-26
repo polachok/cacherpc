@@ -97,7 +97,7 @@ pub enum SubscriptionActive {
 impl Future for SubscriptionActive {
     type Output = bool;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let mut inner = Pin::into_inner(self);
         match &mut inner {
             SubscriptionActive::Ready(res) => Poll::Ready(*res),
@@ -163,10 +163,15 @@ impl PubSubManager {
         &self,
         sub: Subscription,
         commitment: Commitment,
+        owner: Option<Pubkey>,
     ) -> SubscriptionActive {
         if self.websocket_connected(sub.key()) {
             let addr = self.get_addr_by_key(sub.key());
-            SubscriptionActive::Request(addr.send(IsSubActive { sub, commitment }))
+            SubscriptionActive::Request(addr.send(IsSubActive {
+                sub,
+                commitment,
+                owner,
+            }))
         } else {
             SubscriptionActive::Ready(false)
         }
@@ -185,6 +190,11 @@ impl PubSubManager {
     pub fn subscribe(&self, sub: Subscription, commitment: Commitment, filters: Option<Filters>) {
         let addr = self.get_addr_by_key(sub.key());
         addr.do_send(AccountCommand::Subscribe(sub, commitment, filters))
+    }
+
+    pub fn unsubscribe(&self, sub: Subscription, commitment: Commitment) {
+        let addr = self.get_addr_by_key(sub.key());
+        addr.do_send(AccountCommand::Purge(sub, commitment))
     }
 }
 
@@ -1078,7 +1088,14 @@ impl Handler<IsSubActive> for AccountUpdateManager {
     type Result = bool;
 
     fn handle(&mut self, item: IsSubActive, _: &mut Context<Self>) -> bool {
-        self.sub_to_id.contains_key(&(item.sub, item.commitment))
+        let owner_sub = item
+            .owner
+            .map(|sub| {
+                self.sub_to_id
+                    .contains_key(&(Subscription::Program(sub), item.commitment))
+            })
+            .unwrap_or(false);
+        self.sub_to_id.contains_key(&(item.sub, item.commitment)) || owner_sub
     }
 }
 
@@ -1099,6 +1116,11 @@ impl Handler<AccountCommand> for AccountUpdateManager {
                     }
                 }
                 AccountCommand::Purge(sub, commitment) => {
+                    if !self.subs.contains_key(&(sub, commitment)) {
+                        // for handling cases when we might optimistically unsubscribe from program
+                        // accounts which might not be present
+                        return Ok(());
+                    }
                     metrics()
                         .commands
                         .with_label_values(&[&self.actor_name, "purge"])
@@ -1346,6 +1368,7 @@ pub enum AccountCommand {
 pub struct IsSubActive {
     sub: Subscription,
     commitment: Commitment,
+    owner: Option<Pubkey>,
 }
 
 enum DelayQueueCommand<T> {
