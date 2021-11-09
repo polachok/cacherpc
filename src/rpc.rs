@@ -360,8 +360,9 @@ impl State {
             Ok(Some(data)) => {
                 T::cache_hit_counter().inc();
                 self.reset(request.sub_descriptor());
-                if request.has_active_subscription(&self).await {
-                    return data;
+                let owner = data.as_ref().ok().map(|data| data.owner).flatten();
+                if request.has_active_subscription(&self, owner).await {
+                    return data.map(|data| data.response);
                 } else {
                     (true, false)
                 }
@@ -376,7 +377,7 @@ impl State {
                 if let Some(data) = data {
                     T::cache_hit_counter().inc();
                     self.reset(request.sub_descriptor());
-                    return data;
+                    return data.map(|data| data.response);
                 }
 
                 metrics()
@@ -405,7 +406,7 @@ impl State {
                         T::cache_hit_counter().inc();
                         T::cache_filled_counter().inc();
                         self.reset(request.sub_descriptor());
-                        return data;
+                        return data.map(|data| data.response);
                     }
                     continue;
                 }
@@ -436,10 +437,11 @@ impl State {
 
                 match resp {
                     Ok(Response::Result(data)) => {
+                        let owner = data.owner();
                         if this.is_caching_allowed() && request.put_into_cache(&this, data) {
                             debug!(%request, "cached for key");
                             this.map_updated.notify();
-                            if !request.has_active_subscription(&this).await {
+                            if !request.has_active_subscription(&this, owner).await {
                                 this.subscribe(request.sub_descriptor());
                             } else {
                                 info!(%request, "subscription skipped");
@@ -465,20 +467,43 @@ impl State {
     }
 }
 
+struct CachedResponse {
+    owner: Option<Pubkey>,
+    response: HttpResponse,
+}
+
 type CacheResult<'a> = Result<HttpResponse, Error<'a>>;
+
+trait HasOwner {
+    fn owner(&self) -> Option<Pubkey> {
+        None
+    }
+}
+
+impl HasOwner for AccountContext {
+    fn owner(&self) -> Option<Pubkey> {
+        self.value.as_ref().map(|value| value.owner)
+    }
+}
+
+impl HasOwner for MaybeContext<Vec<AccountAndPubkey>> {}
 
 trait Cacheable: Sized + 'static {
     const REQUEST_TYPE: &'static str;
-    type ResponseData: DeserializeOwned;
+    type ResponseData: DeserializeOwned + HasOwner;
 
     fn parse<'a>(request: &Request<'a, RawValue>) -> Result<Self, Error<'a>>;
     fn get_limit(state: &State) -> &Semaphore;
 
     fn is_cacheable(&self, state: &State) -> Result<(), UncacheableReason>;
     // method to check whether cached entry has corresponding websocket subscription
-    fn has_active_subscription(&self, state: &State) -> SubscriptionActive;
+    fn has_active_subscription(&self, state: &State, owner: Option<Pubkey>) -> SubscriptionActive;
 
-    fn get_from_cache<'a>(&self, id: &Id<'a>, state: &State) -> Option<CacheResult<'a>>;
+    fn get_from_cache<'a>(
+        &self,
+        id: &Id<'a>,
+        state: &State,
+    ) -> Option<Result<CachedResponse, Error<'a>>>;
 
     fn put_into_cache(&self, state: &State, data: Self::ResponseData) -> bool;
 
@@ -545,14 +570,7 @@ impl Cacheable for GetAccountInfo {
 
     // for getAccountInfo requests, we don't need to subscribe in case if the owner program exists,
     // and there's already an active subscription present for it
-    fn has_active_subscription(&self, state: &State) -> SubscriptionActive {
-        let owner = state.accounts.get(&self.pubkey).and_then(|data| {
-            data.value()
-                .get(self.commitment())
-                .map(|(info, _)| info)
-                .flatten()
-                .map(|acc| acc.owner)
-        });
+    fn has_active_subscription(&self, state: &State, owner: Option<Pubkey>) -> SubscriptionActive {
         state.subscription_active(Subscription::Account(self.pubkey), self.commitment(), owner)
     }
 
@@ -568,9 +586,16 @@ impl Cacheable for GetAccountInfo {
         }
     }
 
-    fn get_from_cache<'a>(&self, id: &Id<'a>, state: &State) -> Option<CacheResult<'a>> {
+    fn get_from_cache<'a>(
+        &self,
+        id: &Id<'a>,
+        state: &State,
+    ) -> Option<Result<CachedResponse, Error<'a>>> {
         state.accounts.get(&self.pubkey).and_then(|data| {
             let mut account = data.value().get(self.commitment());
+            let owner = account
+                .map(|(info, _)| info.map(|info| info.owner))
+                .flatten();
             account = account.map(|(info, mut slot)| {
                 if slot == 0 {
                     if let Some(info) = info {
@@ -594,9 +619,12 @@ impl Cacheable for GetAccountInfo {
                         self.pubkey,
                     );
                     match resp {
-                        Ok(res) => Some(Ok(res)),
+                        Ok(res) => Some(Ok(CachedResponse {
+                            response: res,
+                            owner,
+                        })),
                         Err(Error::Parsing(_)) => None,
-                        e => Some(e),
+                        Err(e) => Some(Err(e)),
                     }
                 }
                 _ => None,
@@ -678,7 +706,7 @@ impl Cacheable for GetProgramAccounts {
         state.program_accounts_request_limit.as_ref()
     }
 
-    fn has_active_subscription(&self, state: &State) -> SubscriptionActive {
+    fn has_active_subscription(&self, state: &State, _owner: Option<Pubkey>) -> SubscriptionActive {
         state.subscription_active(Subscription::Program(self.pubkey), self.commitment(), None)
     }
 
@@ -696,7 +724,11 @@ impl Cacheable for GetProgramAccounts {
         }
     }
 
-    fn get_from_cache<'a>(&self, id: &Id<'a>, state: &State) -> Option<CacheResult<'a>> {
+    fn get_from_cache<'a>(
+        &self,
+        id: &Id<'a>,
+        state: &State,
+    ) -> Option<Result<CachedResponse, Error<'a>>> {
         let with_context = self.config.with_context.unwrap_or(false);
         let commitment = self.commitment();
         let filters = self.filters.as_ref();
@@ -712,7 +744,10 @@ impl Cacheable for GetProgramAccounts {
                 let res =
                     program_accounts_response(id_, accounts, config, filters, state, with_context);
                 match res {
-                    Ok(res) => Some(Ok(res)),
+                    Ok(res) => Some(Ok(CachedResponse {
+                        owner: None,
+                        response: res,
+                    })),
                     Err(ProgramAccountsResponseError::Base58) => {
                         Some(Err(base58_error(id.clone())))
                     }
