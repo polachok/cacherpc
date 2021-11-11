@@ -61,6 +61,10 @@ rand = "0.8"
 name = "filters_bench"
 harness = false
 
+[[bench]]
+name = "lua_filter"
+harness = false
+
 [patch.crates-io]
 solana-account-decoder = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }
 solana-sdk = { git = "https://github.com/polachok/solana", rev = "ec4e167b00b2fd3799b935bb7ca49775f6a4b63e" }

@@ -17,14 +17,10 @@ use lru::LruCache;
 use tokio::sync::{watch, Notify, Semaphore};
 use tracing::info;
 
-use mlua::{Lua, LuaOptions, StdLib};
-
 pub use cache_rpc::{cli, metrics, pubsub, rpc, types};
 
 use pubsub::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
-
-const LUA_JSON: &str = include_str!("json.lua");
 
 #[actix_web::main]
 async fn main() -> Result<()> {
@@ -71,25 +67,6 @@ async fn main() -> Result<()> {
 
     run(options).await?;
     Ok(())
-}
-
-fn lua(rules: &str) -> Result<Lua, mlua::Error> {
-    // if any of the lua preparation steps contain errors, then WAF will not be used
-    let lua = Lua::new_with(
-        StdLib::MATH | StdLib::STRING | StdLib::PACKAGE,
-        LuaOptions::default(),
-    )?;
-
-    let func = lua.load(LUA_JSON).into_function()?;
-
-    let _: mlua::Value<'_> = lua.load_from_function("json", func)?;
-
-    let rules = lua.load(&rules).into_function()?;
-
-    let _: mlua::Value<'_> = lua.load_from_function("waf", rules)?;
-
-    info!("loaded WAF rules");
-    Ok(lua)
 }
 
 async fn config_read_loop(path: PathBuf, rpc: Arc<watch::Sender<rpc::Config>>) {
@@ -216,7 +193,7 @@ async fn run(options: cli::Options) -> Result<()> {
             },
             lua: rules
                 .as_ref()
-                .map(|rules| match lua(rules) {
+                .map(|rules| match cache_rpc::init_lua(rules) {
                     Ok(lua) => Some(lua),
                     Err(e) => {
                         eprintln!(

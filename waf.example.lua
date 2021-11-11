@@ -19,14 +19,14 @@ local json = require 'json'
 
 function waf.request(data)
 	if data.method == 'getAccountInfo' then
-		local params = json.decode(data.params)
-		if params[1] == '58KcficuUqPDcMittSddhT8LzsPJoH46YP4uURoMo5EB' then
-			return true, ''
-        else
-            return false, 'Account not in a WAF white list'
-		end
+		-- local params = json.decode(data.params)
+		-- if params[1] == '58KcficuUqPDcMittSddhT8LzsPJoH46YP4uURoMo5EB' then
+			return true
+        --else
+         --   return false, 'Account not in a WAF white list'
+	--	end
 	end
-    return true, ''
+    return true
 end
 
 return waf
