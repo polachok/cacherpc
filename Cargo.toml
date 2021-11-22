@@ -43,7 +43,7 @@ either = "1.6"
 humantime = "2.1"
 toml = "0.5"
 arc-swap = "1.4"
-mlua = { version = "0.6", features = ["luajit", "vendored"] }
+mlua = { version = "0.6", features = ["luajit", "vendored", "send"] }
 awc-uds = "0.1.0"
 
 solana-account-decoder = { version = "=1.8.2", optional = true }

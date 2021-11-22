@@ -17,14 +17,10 @@ use lru::LruCache;
 use tokio::sync::{watch, Notify, Semaphore};
 use tracing::info;
 
-use mlua::{Lua, LuaOptions, StdLib};
-
 pub use cache_rpc::{cli, metrics, pubsub, rpc, types};
 
 use pubsub::PubSubManager;
 use types::{AccountsDb, ProgramAccountsDb};
-
-const LUA_JSON: &str = include_str!("json.lua");
 
 #[actix_web::main]
 async fn main() -> Result<()> {
@@ -75,25 +71,6 @@ async fn main() -> Result<()> {
 
     run(options).await?;
     Ok(())
-}
-
-fn lua(rules: &str) -> Result<Lua, mlua::Error> {
-    // if any of the lua preparation steps contain errors, then WAF will not be used
-    let lua = Lua::new_with(
-        StdLib::MATH | StdLib::STRING | StdLib::PACKAGE,
-        LuaOptions::default(),
-    )?;
-
-    let func = lua.load(LUA_JSON).into_function()?;
-
-    let _: mlua::Value<'_> = lua.load_from_function("json", func)?;
-
-    let rules = lua.load(&rules).into_function()?;
-
-    let _: mlua::Value<'_> = lua.load_from_function("waf", rules)?;
-
-    info!("loaded WAF rules");
-    Ok(lua)
 }
 
 async fn config_read_loop(path: PathBuf, rpc: Arc<watch::Sender<rpc::Config>>) {
@@ -180,11 +157,34 @@ async fn run(options: cli::Options) -> Result<()> {
         actix::spawn(config_read_loop(path.clone(), Arc::clone(&rpc_tx)));
         rpc_config_sender = Some(RpcConfigSender::new(rpc_tx, path));
     }
+    let lua = rules
+                .map(|rules| match rpc::lua(&rules) {
+                    Ok(lua) => lua,
+                    Err(e) => {
+                        eprintln!(
+                            "WAF rules were provided, but program was unable to parse them:\n{}\nFix the rules and try again.",
+                            e
+                        );
+                        std::process::exit(1);
+                    }
+                });
+
+    let mut waf = None;
+
+    if lua.is_some() && options.rules.is_some() {
+        waf = Some(RefCell::new(rpc::Waf {
+            lua: lua.unwrap(),
+            path: options.rules.unwrap(),
+        }));
+    }
+
+    let (waf_tx, waf_rx) = watch::channel(());
 
     let control_state = ControlState::new(
         subscriptions_allowed,
         rpc_config_sender,
         options.control_socket_path,
+        waf_tx,
     );
 
     actix::spawn(run_control_interface(control_state));
@@ -199,7 +199,7 @@ async fn run(options: cli::Options) -> Result<()> {
                 awc::Connector::new()
                     .conn_keep_alive(Duration::from_secs(60))
                     .conn_lifetime(Duration::from_secs(600))
-                    .limit(total_connection_limit)
+                    .limit(total_connection_limit),
             )
             .finish();
         let state = rpc::State {
@@ -218,19 +218,8 @@ async fn run(options: cli::Options) -> Result<()> {
                 let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);
                 format!("rpc-{}", id)
             },
-            lua: rules
-                .as_ref()
-                .map(|rules| match lua(rules) {
-                    Ok(lua) => Some(lua),
-                    Err(e) => {
-                        eprintln!(
-                            "WAF rules were provided, but program was unable to parse them:\n{}\nFix the rules and try again.",
-                            e
-                        );
-                        std::process::exit(1);
-                    }
-                })
-                .flatten(),
+            waf: waf.clone(),
+            waf_watch: RefCell::new(waf_rx.clone()),
         };
         let cors = Cors::default()
             .allow_any_origin()

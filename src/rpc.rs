@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::{self, Debug};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use bytes::Bytes;
 use dashmap::mapref::one::Ref;
 use futures_util::stream::{Stream, StreamExt, TryStreamExt};
 use lru::LruCache;
-use mlua::Lua;
+use mlua::{Lua, LuaOptions, StdLib};
 use prometheus::IntCounter;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::value::{to_raw_value, RawValue};
@@ -259,9 +260,29 @@ pub struct State {
     pub program_accounts_request_limit: Arc<Semaphore>,
     pub config: Arc<ArcSwap<Config>>,
     pub config_watch: RefCell<watch::Receiver<Config>>,
+    pub waf_watch: RefCell<watch::Receiver<()>>,
     pub lru: RefCell<LruCache<u64, LruEntry>>,
     pub worker_id: String,
-    pub lua: Option<Lua>,
+    pub waf: Option<RefCell<Waf>>,
+}
+
+pub struct Waf {
+    pub lua: Lua,
+    pub path: PathBuf,
+}
+
+impl Clone for Waf {
+    fn clone(&self) -> Self {
+        let lua = std::fs::read_to_string(&self.path)
+            .map(|source| lua(&source))
+            .unwrap()
+            .unwrap();
+
+        Self {
+            lua,
+            path: self.path.clone(),
+        }
+    }
 }
 
 impl State {
@@ -1424,20 +1445,81 @@ impl<'de> Deserialize<'de> for OneOrMany<'de> {
     }
 }
 
+async fn check_config_change(state: &web::Data<State>) {
+    use std::future::Future;
+    use std::task::Poll;
+    // apply new config (if any)
+    {
+        let mut rx = state.config_watch.borrow_mut();
+
+        let changed = futures_util::future::poll_fn(|ctx| {
+            let fut = rx.changed();
+            tokio::pin!(fut);
+            match fut.poll(ctx) {
+                Poll::Pending => Poll::Ready(false),
+                Poll::Ready(_) => Poll::Ready(true),
+            }
+        })
+        .await;
+        if changed {
+            apply_config(state, rx.borrow().clone()).await;
+        }
+    }
+    // apply new lua rules (if any)
+    {
+        let mut rx = state.waf_watch.borrow_mut();
+
+        let changed = futures_util::future::poll_fn(|ctx| {
+            let fut = rx.changed();
+            tokio::pin!(fut);
+            match fut.poll(ctx) {
+                Poll::Pending => Poll::Ready(false),
+                Poll::Ready(_) => Poll::Ready(true),
+            }
+        })
+        .await;
+        if changed {
+            if let Some(ref waf) = state.waf {
+                let mut waf = waf.borrow_mut();
+                let rules = match std::fs::read_to_string(&waf.path)
+                    .ok()
+                    .map(|source| lua(&source))
+                {
+                    Some(Ok(rules)) => rules,
+                    Some(Err(error)) => {
+                        warn!(%error, path=?waf.path, "coudn't parse waf rules from file");
+                        return;
+                    }
+                    _ => {
+                        warn!("coudn't read waf rules from file");
+                        return;
+                    }
+                };
+                let new_waf = Waf {
+                    lua: rules,
+                    path: waf.path.clone(),
+                };
+                *waf = new_waf;
+                info!("Updated waf rules");
+            }
+        }
+    }
+}
+
 pub async fn rpc_handler(
     body: Bytes,
     app_state: web::Data<State>,
 ) -> Result<HttpResponse, Error<'static>> {
-    use std::future::Future;
-    use std::task::Poll;
-
     let req: OneOrMany<'_> = match serde_json::from_slice(&body) {
         Ok(val) => val,
         Err(_) => return Ok(Error::InvalidRequest(None, Some("Invalid request")).error_response()),
     };
 
+    check_config_change(&app_state).await;
+
     // run WAF checks on all subquiries in request
-    if let Some(lua) = &app_state.lua {
+    if let Some(waf) = &app_state.waf {
+        let lua = &waf.borrow().lua;
         for r in req.iter() {
             let res = lua.scope(|scope| {
                 lua.globals()
@@ -1462,24 +1544,6 @@ pub async fn rpc_handler(
                 metrics().waf_rejections.inc();
                 return Ok(Error::WAFRejection(Some(r.id.clone()), err).error_response());
             }
-        }
-    }
-
-    // apply new config (if any) before proceeding
-    {
-        let mut rx = app_state.config_watch.borrow_mut();
-
-        let changed = futures_util::future::poll_fn(|ctx| {
-            let fut = rx.changed();
-            tokio::pin!(fut);
-            match fut.poll(ctx) {
-                Poll::Pending => Poll::Ready(false),
-                Poll::Ready(_) => Poll::Ready(true),
-            }
-        })
-        .await;
-        if changed {
-            apply_config(&app_state, rx.borrow().clone()).await;
         }
     }
 
@@ -1725,4 +1789,24 @@ pub fn get_mint_decimals(mint: &SolanaPubkey) -> Result<u8, &'static str> {
     } else {
         Err("Invalid param: mint is not native")
     }
+}
+
+const LUA_JSON: &str = include_str!("json.lua");
+pub fn lua(rules: &str) -> Result<Lua, mlua::Error> {
+    // if any of the lua preparation steps contain errors, then WAF will not be used
+    let lua = Lua::new_with(
+        StdLib::MATH | StdLib::STRING | StdLib::PACKAGE,
+        LuaOptions::default(),
+    )?;
+
+    let func = lua.load(LUA_JSON).into_function()?;
+
+    let _: mlua::Value<'_> = lua.load_from_function("json", func)?;
+
+    let rules = lua.load(&rules).into_function()?;
+
+    let _: mlua::Value<'_> = lua.load_from_function("waf", rules)?;
+
+    info!("loaded WAF rules");
+    Ok(lua)
 }
