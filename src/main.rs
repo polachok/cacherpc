@@ -130,11 +130,7 @@ async fn run(options: cli::Options) -> Result<()> {
         Arc::clone(&subscriptions_allowed),
     );
 
-    let rules = options
-        .rules
-        .as_ref()
-        .map(std::fs::read_to_string)
-        .transpose()?;
+    let rules_path = options.rules.clone();
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
@@ -157,26 +153,6 @@ async fn run(options: cli::Options) -> Result<()> {
         actix::spawn(config_read_loop(path.clone(), Arc::clone(&rpc_tx)));
         rpc_config_sender = Some(RpcConfigSender::new(rpc_tx, path));
     }
-    let lua = rules
-                .map(|rules| match rpc::lua(&rules) {
-                    Ok(lua) => lua,
-                    Err(e) => {
-                        eprintln!(
-                            "WAF rules were provided, but program was unable to parse them:\n{}\nFix the rules and try again.",
-                            e
-                        );
-                        std::process::exit(1);
-                    }
-                });
-
-    let mut waf = None;
-
-    if lua.is_some() && options.rules.is_some() {
-        waf = Some(RefCell::new(rpc::Waf {
-            lua: lua.unwrap(),
-            path: options.rules.unwrap(),
-        }));
-    }
 
     let (waf_tx, waf_rx) = watch::channel(());
 
@@ -192,6 +168,16 @@ async fn run(options: cli::Options) -> Result<()> {
     let rpc_config = Arc::new(ArcSwap::from(Arc::new(config.rpc)));
 
     HttpServer::new(move || {
+        let waf = rules_path
+            .as_ref()
+            .map(rpc::Waf::new)
+            .transpose()
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to load waf rules");
+            })
+            .ok()
+            .flatten();
+
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
             .no_default_headers()
@@ -218,7 +204,7 @@ async fn run(options: cli::Options) -> Result<()> {
                 let id = worker_id_counter.fetch_add(1, Ordering::SeqCst);
                 format!("rpc-{}", id)
             },
-            waf: waf.clone(),
+            waf,
             waf_watch: RefCell::new(waf_rx.clone()),
         };
         let cors = Cors::default()

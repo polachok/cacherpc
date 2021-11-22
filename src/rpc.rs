@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::{self, Debug};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -263,25 +263,44 @@ pub struct State {
     pub waf_watch: RefCell<watch::Receiver<()>>,
     pub lru: RefCell<LruCache<u64, LruEntry>>,
     pub worker_id: String,
-    pub waf: Option<RefCell<Waf>>,
+    pub waf: Option<Waf>,
 }
 
 pub struct Waf {
-    pub lua: Lua,
-    pub path: PathBuf,
+    lua: Lua,
+    path: PathBuf,
 }
 
-impl Clone for Waf {
-    fn clone(&self) -> Self {
-        let lua = std::fs::read_to_string(&self.path)
-            .map(|source| lua(&source))
-            .unwrap()
-            .unwrap();
+impl Waf {
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        const LUA_JSON: &str = include_str!("json.lua");
+        // if any of the lua preparation steps contain errors, then WAF will not be used
+        let lua = Lua::new_with(
+            StdLib::MATH | StdLib::STRING | StdLib::PACKAGE,
+            LuaOptions::default(),
+        )?;
 
-        Self {
+        let func = lua.load(LUA_JSON).into_function()?;
+
+        let _: mlua::Value<'_> = lua.load_from_function("json", func)?;
+
+        let waf = Waf {
             lua,
-            path: self.path.clone(),
-        }
+            path: path.as_ref().to_path_buf(),
+        };
+        waf.reload()?;
+
+        Ok(waf)
+    }
+
+    pub fn reload(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let rules = std::fs::read_to_string(&self.path)?;
+
+        let rules = self.lua.load(&rules).into_function()?;
+        let _: mlua::Value<'_> = self.lua.load_from_function("waf", rules)?;
+
+        info!("loaded WAF rules");
+        Ok(())
     }
 }
 
@@ -1480,26 +1499,13 @@ async fn check_config_change(state: &web::Data<State>) {
         .await;
         if changed {
             if let Some(ref waf) = state.waf {
-                let mut waf = waf.borrow_mut();
-                let rules = match std::fs::read_to_string(&waf.path)
-                    .ok()
-                    .map(|source| lua(&source))
-                {
-                    Some(Ok(rules)) => rules,
-                    Some(Err(error)) => {
-                        warn!(%error, path=?waf.path, "coudn't parse waf rules from file");
+                match waf.reload() {
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!(error = %err, "coudn't read waf rules from file");
                         return;
                     }
-                    _ => {
-                        warn!("coudn't read waf rules from file");
-                        return;
-                    }
-                };
-                let new_waf = Waf {
-                    lua: rules,
-                    path: waf.path.clone(),
-                };
-                *waf = new_waf;
+                }
                 info!("Updated waf rules");
             }
         }
@@ -1519,7 +1525,7 @@ pub async fn rpc_handler(
 
     // run WAF checks on all subquiries in request
     if let Some(waf) = &app_state.waf {
-        let lua = &waf.borrow().lua;
+        let lua = &waf.lua;
         for r in req.iter() {
             let res = lua.scope(|scope| {
                 lua.globals()
@@ -1789,24 +1795,4 @@ pub fn get_mint_decimals(mint: &SolanaPubkey) -> Result<u8, &'static str> {
     } else {
         Err("Invalid param: mint is not native")
     }
-}
-
-const LUA_JSON: &str = include_str!("json.lua");
-pub fn lua(rules: &str) -> Result<Lua, mlua::Error> {
-    // if any of the lua preparation steps contain errors, then WAF will not be used
-    let lua = Lua::new_with(
-        StdLib::MATH | StdLib::STRING | StdLib::PACKAGE,
-        LuaOptions::default(),
-    )?;
-
-    let func = lua.load(LUA_JSON).into_function()?;
-
-    let _: mlua::Value<'_> = lua.load_from_function("json", func)?;
-
-    let rules = lua.load(&rules).into_function()?;
-
-    let _: mlua::Value<'_> = lua.load_from_function("waf", rules)?;
-
-    info!("loaded WAF rules");
-    Ok(lua)
 }
