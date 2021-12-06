@@ -820,7 +820,8 @@ impl Cacheable for GetProgramAccounts {
                     filters,
                     state,
                     with_context,
-                );
+                )
+                .await;
                 match res {
                     Ok(res) => Some(Ok(CachedResponse {
                         owner: None,
@@ -1401,7 +1402,7 @@ pub struct AccountAndPubkey {
     pub pubkey: Pubkey,
 }
 
-fn program_accounts_response<'a>(
+async fn program_accounts_response<'a>(
     req_id: Id<'a>,
     accounts: &HashSet<Arc<Pubkey>>,
     config: &'_ ProgramAccountsConfig,
@@ -1409,8 +1410,8 @@ fn program_accounts_response<'a>(
     app_state: &State,
     with_context: bool,
 ) -> Result<HttpResponse, ProgramAccountsResponseError> {
-    struct Encode<'a, K> {
-        inner: Ref<'a, K, AccountState>,
+    struct Encode {
+        inner: Option<AccountInfo>,
         encoding: Encoding,
         slice: Option<Slice>,
         commitment: Commitment,
@@ -1418,15 +1419,12 @@ fn program_accounts_response<'a>(
         pubkey: Pubkey,
     }
 
-    impl<'a, K> Serialize for Encode<'a, K>
-    where
-        K: Eq + std::hash::Hash,
-    {
+    impl Serialize for Encode {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
             S: serde::Serializer,
         {
-            if let Some((Some(value), _)) = self.inner.value().get(self.commitment) {
+            if let Some(value) = self.inner {
                 let encoded = value
                     .encode(
                         self.encoding,
@@ -1444,8 +1442,8 @@ fn program_accounts_response<'a>(
     }
 
     #[derive(Serialize)]
-    struct AccountAndPubkey<'a> {
-        account: Encode<'a, Pubkey>,
+    struct AccountAndPubkey {
+        account: Encode,
         pubkey: Pubkey,
     }
 
@@ -1455,10 +1453,12 @@ fn program_accounts_response<'a>(
     let mut slot = 0;
     let enforce_base58_limit = !app_state.config.load().ignore_base58_limit;
 
+    let accountsdb = app_state.accounts.clone();
+
     for key in accounts {
-        if let Some(data) = app_state.accounts.get(key) {
+        if let Some(data) = accountsdb.get(key) {
             let (account_info, current_slot) = match data.value().get(commitment) {
-                Some(data) => data,
+                Some((account_info, slot)) => (account_info.cloned(), slot),
                 None => {
                     warn!("data for key {}/{:?} not found", key, commitment);
                     return Err(ProgramAccountsResponseError::Inconsistency);
@@ -1477,7 +1477,9 @@ fn program_accounts_response<'a>(
             }
 
             if let Some(filters) = &filters {
-                let matches = account_info.map_or(false, |acc| filters.matches(&acc.data));
+                let matches = account_info
+                    .as_ref()
+                    .map_or(false, |acc| filters.matches(&acc.data));
 
                 if !matches {
                     debug!(pubkey = ?data.key(), "skipped because of filter");
@@ -1487,7 +1489,7 @@ fn program_accounts_response<'a>(
 
             encoded_accounts.push(AccountAndPubkey {
                 account: Encode {
-                    inner: data,
+                    inner: account_info,
                     encoding: config.encoding,
                     slice: config.data_slice,
                     commitment,
@@ -1509,6 +1511,10 @@ fn program_accounts_response<'a>(
         },
         false => MaybeContext::Without(encoded_accounts),
     };
+
+    let value = web::block(move || to_raw_value(&value).unwrap())
+        .await
+        .unwrap();
 
     let resp = JsonRpcResponse {
         jsonrpc: "2.0",
